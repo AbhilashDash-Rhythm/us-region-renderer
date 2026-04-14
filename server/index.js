@@ -22,15 +22,16 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 
 app.use(cors({
   origin: isProduction ? true : ALLOWED_ORIGINS,
-  methods: ['GET', 'HEAD', 'OPTIONS'],
+  methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
 }));
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.set('trust proxy', 1);
 
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60_000;
-const RATE_LIMIT_MAX = 60;
+const RATE_LIMIT_MAX = 120;
 
 function rateLimit(req, res, next) {
   const ip = req.ip || req.connection.remoteAddress;
@@ -56,17 +57,12 @@ setInterval(() => {
 
 const FETCH_TIMEOUT = 30_000;
 
-const US_HEADERS = {
+const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'identity',
   'Cache-Control': 'no-cache',
   'Connection': 'keep-alive',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1',
   'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
   'Sec-CH-UA-Mobile': '?0',
@@ -77,245 +73,168 @@ function getAgent(url) {
   return url.startsWith('https') ? httpsAgent : httpAgent;
 }
 
-async function fetchWithFallback(targetUrl, options) {
+async function proxyFetch(targetUrl, options = {}) {
+  const opts = { ...options, agent: getAgent(targetUrl) };
   try {
-    return await fetch(targetUrl, { ...options, agent: getAgent(targetUrl) });
+    return await fetch(targetUrl, opts);
   } catch (err) {
-    if (targetUrl.startsWith('https://')) {
-      const httpUrl = targetUrl.replace('https://', 'http://');
-      console.log(`HTTPS failed for ${targetUrl}, trying HTTP...`);
-      return fetch(httpUrl, { ...options, agent: httpAgent });
-    }
-    if (targetUrl.startsWith('http://')) {
-      const httpsUrl = targetUrl.replace('http://', 'https://');
-      console.log(`HTTP failed for ${targetUrl}, trying HTTPS...`);
-      return fetch(httpsUrl, { ...options, agent: httpsAgent });
-    }
-    throw err;
+    const alt = targetUrl.startsWith('https://')
+      ? targetUrl.replace('https://', 'http://')
+      : targetUrl.replace('http://', 'https://');
+    return fetch(alt, { ...opts, agent: getAgent(alt) });
   }
 }
 
 function normalizeUrl(raw) {
-  let target = raw.trim();
+  let target = (raw || '').trim();
   if (!/^https?:\/\//i.test(target)) target = `https://${target}`;
   try {
     const parsed = new URL(target);
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Invalid protocol');
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
     return parsed.href;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-const HEADERS_TO_STRIP = [
+const STRIP_HEADERS = new Set([
   'content-security-policy', 'content-security-policy-report-only',
   'x-frame-options', 'x-content-type-options',
   'strict-transport-security', 'permissions-policy',
   'cross-origin-embedder-policy', 'cross-origin-opener-policy',
-  'cross-origin-resource-policy',
-];
+  'cross-origin-resource-policy', 'content-length',
+  'content-encoding', 'transfer-encoding',
+]);
 
-function getProxyOrigin(req) {
-  const proto = req.get('x-forwarded-proto') || req.protocol;
-  const host = req.get('host');
-  return `${proto}://${host}`;
+function cleanHeaders(response) {
+  const h = {};
+  response.headers.forEach((v, k) => {
+    if (!STRIP_HEADERS.has(k.toLowerCase())) h[k] = v;
+  });
+  h['Access-Control-Allow-Origin'] = '*';
+  return h;
 }
 
-function rewriteHtml(html, baseUrl, proxyOrigin) {
-  const proxyRender = `${proxyOrigin}/api/render?url=`;
-  const proxyAsset = `${proxyOrigin}/api/asset?url=`;
+function proxyOrigin(req) {
+  return `${req.get('x-forwarded-proto') || req.protocol}://${req.get('host')}`;
+}
 
-  let baseOrigin;
-  try { baseOrigin = new URL(baseUrl).origin; } catch { baseOrigin = ''; }
+function rewriteHtml(html, baseUrl, origin) {
+  const P = `${origin}/proxy/`;
+
+  function toProxyUrl(rawUrl) {
+    try {
+      const abs = new URL(rawUrl, baseUrl).href;
+      return `${P}${encodeURIComponent(abs)}`;
+    } catch { return rawUrl; }
+  }
 
   html = html.replace(/http:\/\//g, 'https://');
 
   html = html.replace(
-    /(<link[^>]+href=["'])([^"']+)(["'][^>]*>)/gi,
-    (match, before, href, after) => {
-      if (href.startsWith('data:') || href.startsWith(proxyOrigin)) return match;
-      try {
-        const resolved = new URL(href, baseUrl).href;
-        return `${before}${proxyAsset}${encodeURIComponent(resolved)}${after}`;
-      } catch { return match; }
+    /(<(?:link|script|img|source|video|audio|embed|iframe)[^>]*?\s(?:src|href)=["'])([^"']+)(["'])/gi,
+    (m, pre, url, post) => {
+      if (/^(?:data:|blob:|javascript:|#|mailto:)/.test(url)) return m;
+      return `${pre}${toProxyUrl(url)}${post}`;
     }
   );
 
   html = html.replace(
-    /(<script[^>]+src=["'])([^"']+)(["'][^>]*>)/gi,
-    (match, before, src, after) => {
-      if (src.startsWith('data:') || src.startsWith(proxyOrigin)) return match;
-      try {
-        const resolved = new URL(src, baseUrl).href;
-        return `${before}${proxyAsset}${encodeURIComponent(resolved)}${after}`;
-      } catch { return match; }
+    /(<(?:form)[^>]*?\saction=["'])([^"']*)(["'])/gi,
+    (m, pre, url, post) => {
+      if (!url || url.startsWith('#') || url.startsWith('javascript:')) return m;
+      return `${pre}${origin}/api/render?url=${encodeURIComponent(new URL(url, baseUrl).href)}${post}`;
     }
   );
 
   html = html.replace(
-    /(<img[^>]+src=["'])([^"']+)(["'][^>]*>)/gi,
-    (match, before, src, after) => {
-      if (src.startsWith('data:') || src.startsWith(proxyOrigin)) return match;
-      try {
-        const resolved = new URL(src, baseUrl).href;
-        return `${before}${proxyAsset}${encodeURIComponent(resolved)}${after}`;
-      } catch { return match; }
+    /(url\s*\(\s*["']?)(?!data:|blob:|#)([^"')]+)(["']?\s*\))/gi,
+    (m, pre, url, post) => {
+      try { return `${pre}${toProxyUrl(url)}${post}`; }
+      catch { return m; }
     }
   );
 
   html = html.replace(
-    /(url\s*\(\s*["']?)([^"')]+)(["']?\s*\))/gi,
-    (match, before, url, after) => {
-      if (url.startsWith('data:') || url.startsWith(proxyOrigin) || url.startsWith('#')) return match;
-      try {
-        const resolved = new URL(url, baseUrl).href;
-        return `${before}${proxyAsset}${encodeURIComponent(resolved)}${after}`;
-      } catch { return match; }
-    }
-  );
-
-  html = html.replace(
-    /(<form[^>]+action=["'])([^"']+)(["'][^>]*>)/gi,
-    (match, before, action, after) => {
-      if (action.startsWith('#') || action.startsWith('javascript:')) return match;
-      try {
-        const resolved = new URL(action, baseUrl).href;
-        return `${before}${proxyRender}${encodeURIComponent(resolved)}${after}`;
-      } catch { return match; }
+    /(<style[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    (m, open, css, close) => {
+      const rewritten = css.replace(
+        /@import\s+(?:url\s*\()?\s*["']?([^"');\s]+)["']?\s*\)?/gi,
+        (im, url) => `@import url('${toProxyUrl(url)}')`
+      );
+      return `${open}${rewritten}${close}`;
     }
   );
 
   html = html.replace(
     /<meta\s+http-equiv=["']refresh["'][^>]*content=["']\d+;\s*url=([^"']+)["'][^>]*\/?>/gi,
-    (match, redirectUrl) => {
-      try {
-        const resolved = new URL(redirectUrl.trim(), baseUrl).href;
-        return `<!-- proxy-stripped-redirect: ${resolved} -->`;
-      } catch { return match; }
-    }
+    () => ''
   );
 
   html = html.replace(
-    /window\.location\s*=\s*["']([^"']+)["']/g,
-    (match, url) => {
+    /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/g,
+    (m, url) => {
       try {
-        const resolved = new URL(url, baseUrl).href;
-        return `window.parent.postMessage({type:'proxy-navigate',url:'${resolved}'},'*')`;
-      } catch { return match; }
+        const abs = new URL(url, baseUrl).href;
+        return `window.parent.postMessage({type:'proxy-navigate',url:'${abs}'},'*')`;
+      } catch { return m; }
     }
   );
 
-  const proxyScript = `<script>
-(function() {
-  if (window.__proxyPatched) return;
-  window.__proxyPatched = true;
-  var P = '${proxyOrigin}';
-  var R = P + '/api/render?url=';
-  var A = P + '/api/asset?url=';
+  const script = `<script>(function(){
+if(window.__px) return; window.__px=1;
+var O='${origin}', B='${baseUrl}';
+document.addEventListener('click',function(e){
+  var a=e.target&&(e.target.closest?e.target.closest('a'):null);
+  if(!a||a.tagName!=='A') return;
+  var h=a.getAttribute('href');
+  if(!h||h.startsWith('#')||h.startsWith('javascript:')) return;
+  try{var r=new URL(h,B).href;
+    if(/^https?:/.test(r)){e.preventDefault();e.stopPropagation();
+      window.parent.postMessage({type:'proxy-navigate',url:r},'*');
+  }}catch(x){}
+},true);
+document.addEventListener('submit',function(e){
+  var f=e.target; if(!f||!f.action) return;
+  try{var r=new URL(f.action,B).href;
+    if(/^https?:/.test(r)&&r.indexOf(O)===-1){e.preventDefault();
+      window.parent.postMessage({type:'proxy-navigate',url:r},'*');
+  }}catch(x){}
+},true);
+try{
+  Location.prototype.assign=function(v){try{window.parent.postMessage({type:'proxy-navigate',url:new URL(v,B).href},'*')}catch(x){}};
+  Location.prototype.replace=function(v){try{window.parent.postMessage({type:'proxy-navigate',url:new URL(v,B).href},'*')}catch(x){}};
+  var d=Object.getOwnPropertyDescriptor(Location.prototype,'href');
+  if(d&&d.set){Object.defineProperty(Location.prototype,'href',{get:d.get,set:function(v){
+    try{window.parent.postMessage({type:'proxy-navigate',url:new URL(v,B).href},'*')}catch(x){d.set.call(this,v)}
+  },configurable:true})}
+}catch(x){}
+})();</script>`;
 
-  document.addEventListener('click', function(e) {
-    var a = e.target && (e.target.closest ? e.target.closest('a') : e.target);
-    if (!a || a.tagName !== 'A') return;
-    var href = a.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
-    try {
-      var resolved = new URL(href, '${baseUrl}').href;
-      if (/^https?:/.test(resolved)) {
-        e.preventDefault();
-        e.stopPropagation();
-        window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
-      }
-    } catch(err) {}
-  }, true);
-
-  document.addEventListener('submit', function(e) {
-    var form = e.target;
-    if (form && form.action) {
-      try {
-        var resolved = new URL(form.action, '${baseUrl}').href;
-        if (/^https?:/.test(resolved) && resolved.indexOf(P) === -1) {
-          e.preventDefault();
-          window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
-        }
-      } catch(err) {}
-    }
-  }, true);
-
-  try {
-    Location.prototype.assign = function(v) {
-      var resolved = new URL(v, '${baseUrl}').href;
-      window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
-    };
-    Location.prototype.replace = function(v) {
-      var resolved = new URL(v, '${baseUrl}').href;
-      window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
-    };
-    var hDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-    if (hDesc && hDesc.set) {
-      Object.defineProperty(Location.prototype, 'href', {
-        get: hDesc.get,
-        set: function(v) {
-          try {
-            var resolved = new URL(v, '${baseUrl}').href;
-            window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
-          } catch(e) { hDesc.set.call(this, v); }
-        },
-        configurable: true
-      });
-    }
-  } catch(e) {}
-})();
-</script>`;
-
-  const baseTag = `<base href="${baseUrl}">`;
-  const injection = `${baseTag}\n${proxyScript}`;
+  const base = `<base href="${origin}/proxy/${encodeURIComponent(baseUrl)}/">`;
+  const inject = `${base}\n${script}`;
 
   if (/<head[^>]*>/i.test(html)) {
-    return html.replace(/<head[^>]*>/i, (m) => `${m}\n${injection}`);
+    return html.replace(/<head[^>]*>/i, m => `${m}\n${inject}`);
   }
   if (/<html[^>]*>/i.test(html)) {
-    return html.replace(/<html[^>]*>/i, (m) => `${m}\n<head>${injection}</head>`);
+    return html.replace(/<html[^>]*>/i, m => `${m}\n<head>${inject}</head>`);
   }
-  return `<head>${injection}</head>\n${html}`;
+  return `<head>${inject}</head>\n${html}`;
 }
 
-function buildCleanHeaders(response) {
-  const headers = {};
-  response.headers.forEach((value, key) => {
-    if (!HEADERS_TO_STRIP.includes(key.toLowerCase())) {
-      headers[key] = value;
-    }
-  });
-  delete headers['content-length'];
-  delete headers['content-encoding'];
-  delete headers['transfer-encoding'];
-  return headers;
-}
-
-function errorPage(statusCode, statusText, targetUrl) {
-  return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Proxy Error</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0f;color:#e2e8f0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
-.card{background:#12121a;border:1px solid #2a2a4a;border-radius:12px;padding:40px;max-width:500px;text-align:center}
-h1{color:#ef4444;font-size:3rem;margin:0 0 8px}
-h2{color:#94a3b8;font-weight:400;margin:0 0 24px;font-size:1.1rem}
-p{color:#64748b;line-height:1.6;margin:0 0 16px}
-code{background:#1a1a2e;padding:2px 8px;border-radius:4px;font-size:.85rem;color:#818cf8}
-.hint{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);border-radius:8px;padding:12px 16px;color:#f59e0b;font-size:.85rem;margin-top:20px}
-</style></head><body><div class="card">
-<h1>${statusCode}</h1><h2>${statusText}</h2>
-<p>The target site returned an error from the US proxy server.</p>
-<p>URL: <code>${targetUrl}</code></p>
-<div class="hint">${statusCode === 403
-  ? 'This site has bot/WAF protection that blocks server-side requests. Only real browsers can access it directly.'
-  : statusCode === 404 ? 'The page was not found on the target server.'
-  : statusCode >= 500 ? 'The target server encountered an internal error.'
-  : 'The target server rejected the request.'}</div>
+function errorPage(code, text, url) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{font-family:system-ui,sans-serif;background:#0a0a0f;color:#e2e8f0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
+.c{background:#12121a;border:1px solid #2a2a4a;border-radius:12px;padding:40px;max-width:500px;text-align:center}
+h1{color:#ef4444;font-size:3rem;margin:0 0 8px}h2{color:#94a3b8;font-weight:400;margin:0 0 24px}
+p{color:#64748b;line-height:1.6;margin:0 0 12px}code{background:#1a1a2e;padding:2px 8px;border-radius:4px;color:#818cf8;font-size:.85rem}
+.h{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);border-radius:8px;padding:12px 16px;color:#f59e0b;font-size:.85rem;margin-top:16px}
+</style></head><body><div class="c"><h1>${code}</h1><h2>${text}</h2>
+<p>The target site returned this error from the US proxy.</p><p>URL: <code>${url}</code></p>
+<div class="h">${code===403?'This site has bot/WAF protection blocking server requests.':code===404?'Page not found.':code>=500?'Server error on the target site.':'The request was rejected.'}</div>
 </div></body></html>`;
 }
 
-// ─── Routes ──────────────────────────────────────────
+// ─── ROUTES ──────────────────────────────────────────
 
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -324,43 +243,6 @@ app.get('/api/health', (_req, res) => {
     service: process.env.RENDER_SERVICE_NAME || 'us-region-renderer',
     timestamp: new Date().toISOString(),
   });
-});
-
-app.get('/api/asset', rateLimit, async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('Missing url');
-
-  const targetUrl = normalizeUrl(url);
-  if (!targetUrl) return res.status(400).send('Invalid url');
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-
-    const response = await fetchWithFallback(targetUrl, {
-      headers: {
-        ...US_HEADERS,
-        'Accept': '*/*',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'no-cors',
-      },
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    const headers = buildCleanHeaders(response);
-    headers['Access-Control-Allow-Origin'] = '*';
-    headers['Cache-Control'] = 'public, max-age=3600';
-    res.set(headers);
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    return res.send(buffer);
-  } catch (err) {
-    console.error(`Asset proxy error for ${targetUrl}:`, err.message);
-    return res.status(502).send('Failed to fetch asset');
-  }
 });
 
 app.get('/api/render', rateLimit, async (req, res) => {
@@ -372,88 +254,126 @@ app.get('/api/render', rateLimit, async (req, res) => {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
-    const response = await fetchWithFallback(targetUrl, {
-      headers: US_HEADERS,
+    const response = await proxyFetch(targetUrl, {
+      headers: { ...BROWSER_HEADERS, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1' },
       redirect: 'follow',
       signal: controller.signal,
     });
-
-    clearTimeout(timeout);
+    clearTimeout(timer);
 
     if (!response.ok) {
-      res.set({ 'Content-Type': 'text/html; charset=utf-8' });
+      res.set('Content-Type', 'text/html; charset=utf-8');
       return res.send(errorPage(response.status, response.statusText, targetUrl));
     }
 
-    const contentType = response.headers.get('content-type') || '';
-    const headers = buildCleanHeaders(response);
+    const ct = response.headers.get('content-type') || '';
+    const headers = cleanHeaders(response);
     headers['X-Proxy-Region'] = process.env.RENDER_REGION || 'local';
     headers['X-Original-URL'] = targetUrl;
-    headers['Access-Control-Allow-Origin'] = '*';
 
-    if (contentType.includes('text/html')) {
+    if (ct.includes('text/html')) {
       let html = await response.text();
-      const proxyOrigin = getProxyOrigin(req);
-      html = rewriteHtml(html, targetUrl, proxyOrigin);
+      html = rewriteHtml(html, response.url || targetUrl, proxyOrigin(req));
       headers['Content-Type'] = 'text/html; charset=utf-8';
       res.set(headers);
       return res.send(html);
     }
 
-    if (contentType.includes('text/css') || contentType.includes('javascript')) {
-      const text = await response.text();
-      res.set(headers);
-      return res.send(text);
-    }
-
     res.set(headers);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    return res.send(buffer);
+    const buf = Buffer.from(await response.arrayBuffer());
+    return res.send(buf);
   } catch (err) {
-    if (err.name === 'AbortError') {
-      return res.status(504).json({ error: 'Request timed out' });
-    }
-    console.error(`Render error for ${targetUrl}:`, err.code || '', err.message);
-    return res.status(502).json({ error: 'Failed to fetch the URL', details: err.message, url: targetUrl });
+    if (err.name === 'AbortError') return res.status(504).json({ error: 'Request timed out' });
+    console.error(`Render error [${targetUrl}]:`, err.message);
+    return res.status(502).json({ error: 'Failed to fetch', details: err.message, url: targetUrl });
   }
 });
 
 app.get('/api/info', rateLimit, async (req, res) => {
   const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'URL parameter is required' });
-
+  if (!url) return res.status(400).json({ error: 'URL required' });
   const targetUrl = normalizeUrl(url);
-  if (!targetUrl) return res.status(400).json({ error: 'Invalid URL provided' });
+  if (!targetUrl) return res.status(400).json({ error: 'Invalid URL' });
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    const response = await proxyFetch(targetUrl, {
+      method: 'HEAD', headers: BROWSER_HEADERS, redirect: 'follow', signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const headers = {};
+    response.headers.forEach((v, k) => { headers[k] = v; });
+    return res.json({ status: response.status, statusText: response.statusText, headers, url: response.url, region: process.env.RENDER_REGION || 'US (proxy)', service: process.env.RENDER_SERVICE_NAME || 'local-dev' });
+  } catch (err) {
+    if (err.name === 'AbortError') return res.status(504).json({ error: 'Timed out' });
+    return res.status(502).json({ error: 'Failed', details: err.message });
+  }
+});
 
-    const response = await fetchWithFallback(targetUrl, {
-      method: 'HEAD',
-      headers: US_HEADERS,
+// Catch-all proxy route: /proxy/<encoded-url> serves any resource through the proxy
+app.get('/proxy/:encodedUrl(*)', rateLimit, async (req, res) => {
+  const raw = decodeURIComponent(req.params.encodedUrl);
+  const targetUrl = normalizeUrl(raw);
+  if (!targetUrl) return res.status(400).send('Invalid URL');
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
+    const response = await proxyFetch(targetUrl, {
+      headers: { ...BROWSER_HEADERS, 'Accept': '*/*', 'Sec-Fetch-Dest': 'empty', 'Sec-Fetch-Mode': 'no-cors' },
       redirect: 'follow',
       signal: controller.signal,
     });
+    clearTimeout(timer);
 
-    clearTimeout(timeout);
+    const ct = response.headers.get('content-type') || '';
+    const headers = cleanHeaders(response);
+    headers['Cache-Control'] = 'public, max-age=3600';
 
-    const headers = {};
-    response.headers.forEach((value, key) => { headers[key] = value; });
+    if (ct.includes('text/html')) {
+      let html = await response.text();
+      html = rewriteHtml(html, response.url || targetUrl, proxyOrigin(req));
+      headers['Content-Type'] = 'text/html; charset=utf-8';
+      res.set(headers);
+      return res.send(html);
+    }
 
-    return res.json({
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-      url: response.url,
-      region: process.env.RENDER_REGION || 'US (proxy server)',
-      service: process.env.RENDER_SERVICE_NAME || 'local-dev',
-    });
+    if (ct.includes('text/css')) {
+      let css = await response.text();
+      const origin = proxyOrigin(req);
+      css = css.replace(
+        /url\s*\(\s*["']?(?!data:|blob:|#)([^"')]+)["']?\s*\)/gi,
+        (m, url) => {
+          try {
+            const abs = new URL(url, targetUrl).href;
+            return `url('${origin}/proxy/${encodeURIComponent(abs)}')`;
+          } catch { return m; }
+        }
+      );
+      css = css.replace(
+        /@import\s+(?:url\s*\()?\s*["']?([^"');\s]+)["']?\s*\)?/gi,
+        (m, url) => {
+          try {
+            const abs = new URL(url, targetUrl).href;
+            return `@import url('${origin}/proxy/${encodeURIComponent(abs)}')`;
+          } catch { return m; }
+        }
+      );
+      res.set(headers);
+      return res.send(css);
+    }
+
+    res.set(headers);
+    const buf = Buffer.from(await response.arrayBuffer());
+    return res.send(buf);
   } catch (err) {
-    if (err.name === 'AbortError') return res.status(504).json({ error: 'Request timed out' });
-    return res.status(502).json({ error: 'Failed to fetch info', details: err.message });
+    if (err.name === 'AbortError') return res.status(504).send('Timeout');
+    console.error(`Proxy error [${targetUrl}]:`, err.message);
+    return res.status(502).send('Proxy error');
   }
 });
 
