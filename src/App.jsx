@@ -35,6 +35,20 @@ function App() {
     });
   }, []);
 
+  useEffect(() => {
+    function handleMessage(e) {
+      if (e.data && e.data.type === 'proxy-navigate' && e.data.url) {
+        const targetUrl = e.data.url;
+        const proxyUrl = `${API_BASE}/api/render?url=${encodeURIComponent(targetUrl)}`;
+        setUrl(targetUrl);
+        setRenderedUrl(proxyUrl);
+        addToHistory(targetUrl);
+      }
+    }
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [addToHistory]);
+
   const handleSubmit = useCallback(
     async (e) => {
       e.preventDefault();
@@ -254,7 +268,7 @@ function App() {
                   className="preview-iframe"
                   onLoad={handleIframeLoad}
                   onError={handleIframeError}
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                  sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
                 />
               </div>
             </div>

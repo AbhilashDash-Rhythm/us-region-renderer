@@ -81,15 +81,81 @@ function normalizeUrl(raw) {
   }
 }
 
+function buildProxyScript(baseUrl) {
+  return `<script>
+(function() {
+  var proxyBase = location.origin + '/api/render?url=';
+  var originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    if (url && !url.startsWith(location.origin) && /^https?:/.test(url)) {
+      arguments[1] = proxyBase + encodeURIComponent(url);
+    }
+    return originalOpen.apply(this, arguments);
+  };
+
+  var origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    if (typeof input === 'string' && !input.startsWith(location.origin) && /^https?:/.test(input)) {
+      input = proxyBase + encodeURIComponent(input);
+    }
+    return origFetch.call(this, input, init);
+  };
+
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest('a');
+    if (!a) return;
+    var href = a.getAttribute('href');
+    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+    try {
+      var resolved = new URL(href, '${baseUrl}').href;
+      if (/^https?:/.test(resolved)) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
+      }
+    } catch(err) {}
+  }, true);
+
+  var origAssign = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+  if (origAssign && origAssign.set) {
+    Object.defineProperty(window.location, 'href', {
+      set: function(v) {
+        try {
+          var resolved = new URL(v, '${baseUrl}').href;
+          window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
+        } catch(err) {
+          origAssign.set.call(this, v);
+        }
+      },
+      get: origAssign.get ? origAssign.get.bind(window.location) : undefined
+    });
+  }
+
+  var origReplace = Location.prototype.replace;
+  Location.prototype.replace = function(v) {
+    try {
+      var resolved = new URL(v, '${baseUrl}').href;
+      window.parent.postMessage({ type: 'proxy-navigate', url: resolved }, '*');
+    } catch(err) {
+      origReplace.call(this, v);
+    }
+  };
+})();
+</script>`;
+}
+
 function injectBase(html, baseUrl) {
   const baseTag = `<base href="${baseUrl}">`;
+  const proxyScript = buildProxyScript(baseUrl);
+  const injection = `${baseTag}\n    ${proxyScript}`;
+
   if (/<head[^>]*>/i.test(html)) {
-    return html.replace(/<head[^>]*>/i, (match) => `${match}\n    ${baseTag}`);
+    return html.replace(/<head[^>]*>/i, (match) => `${match}\n    ${injection}`);
   }
   if (/<html[^>]*>/i.test(html)) {
-    return html.replace(/<html[^>]*>/i, (match) => `${match}\n<head>${baseTag}</head>`);
+    return html.replace(/<html[^>]*>/i, (match) => `${match}\n<head>${injection}</head>`);
   }
-  return `${baseTag}\n${html}`;
+  return `${injection}\n${html}`;
 }
 
 app.get('/api/health', (_req, res) => {
