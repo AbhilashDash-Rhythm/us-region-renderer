@@ -1,8 +1,13 @@
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
+import http from 'http';
+import https from 'https';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,7 +60,7 @@ setInterval(() => {
   }
 }, RATE_LIMIT_WINDOW);
 
-const FETCH_TIMEOUT = 20_000;
+const FETCH_TIMEOUT = 30_000;
 
 const US_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -63,7 +68,39 @@ const US_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'identity',
   'Cache-Control': 'no-cache',
+  'Connection': 'keep-alive',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'Sec-CH-UA-Mobile': '?0',
+  'Sec-CH-UA-Platform': '"Windows"',
 };
+
+function getAgent(url) {
+  return url.startsWith('https') ? httpsAgent : httpAgent;
+}
+
+async function fetchWithFallback(targetUrl, options) {
+  try {
+    const response = await fetch(targetUrl, { ...options, agent: getAgent(targetUrl) });
+    return response;
+  } catch (err) {
+    if (targetUrl.startsWith('https://')) {
+      const httpUrl = targetUrl.replace('https://', 'http://');
+      console.log(`HTTPS failed for ${targetUrl}, retrying with HTTP...`);
+      return fetch(httpUrl, { ...options, agent: httpAgent });
+    }
+    if (targetUrl.startsWith('http://')) {
+      const httpsUrl = targetUrl.replace('http://', 'https://');
+      console.log(`HTTP failed for ${targetUrl}, retrying with HTTPS...`);
+      return fetch(httpsUrl, { ...options, agent: httpsAgent });
+    }
+    throw err;
+  }
+}
 
 function normalizeUrl(raw) {
   let target = raw.trim();
@@ -248,7 +285,7 @@ app.get('/api/render', rateLimit, async (req, res) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
-    const response = await fetch(targetUrl, {
+    const response = await fetchWithFallback(targetUrl, {
       headers: US_HEADERS,
       redirect: 'follow',
       signal: controller.signal,
@@ -269,6 +306,35 @@ app.get('/api/render', rateLimit, async (req, res) => {
         proxyHeaders[key] = value;
       }
     });
+
+    if (!response.ok) {
+      const statusCode = response.status;
+      const statusText = response.statusText;
+      const errorHtml = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Proxy Error</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0f; color: #e2e8f0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+  .card { background: #12121a; border: 1px solid #2a2a4a; border-radius: 12px; padding: 40px; max-width: 500px; text-align: center; }
+  h1 { color: #ef4444; font-size: 3rem; margin: 0 0 8px; }
+  h2 { color: #94a3b8; font-weight: 400; margin: 0 0 24px; font-size: 1.1rem; }
+  p { color: #64748b; line-height: 1.6; margin: 0 0 16px; }
+  code { background: #1a1a2e; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; color: #818cf8; }
+  .hint { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; padding: 12px 16px; color: #f59e0b; font-size: 0.85rem; margin-top: 20px; }
+</style></head><body><div class="card">
+  <h1>${statusCode}</h1>
+  <h2>${statusText}</h2>
+  <p>The target site returned an error when accessed from the US proxy server.</p>
+  <p>URL: <code>${targetUrl}</code></p>
+  <div class="hint">${statusCode === 403
+    ? 'This site likely has bot protection (WAF/Cloudflare) that blocks server-side requests. Only real browsers can access it.'
+    : statusCode === 404 ? 'The page was not found on the target server.'
+    : statusCode >= 500 ? 'The target server encountered an internal error.'
+    : 'The target server rejected the request.'}</div>
+</div></body></html>`;
+
+      res.set({ 'Content-Type': 'text/html; charset=utf-8' });
+      return res.status(200).send(errorHtml);
+    }
 
     if (contentType.includes('text/html')) {
       let html = await response.text();
@@ -297,8 +363,13 @@ app.get('/api/render', rateLimit, async (req, res) => {
     if (err.name === 'AbortError') {
       return res.status(504).json({ error: 'Request timed out', details: 'The target URL took too long to respond.' });
     }
-    console.error('Render error:', err.message);
-    return res.status(502).json({ error: 'Failed to fetch the URL', details: err.message });
+    console.error(`Render error for ${targetUrl}:`, err.code || '', err.message);
+    return res.status(502).json({
+      error: 'Failed to fetch the URL',
+      details: err.message,
+      code: err.code || 'UNKNOWN',
+      url: targetUrl,
+    });
   }
 });
 
@@ -318,7 +389,7 @@ app.get('/api/info', rateLimit, async (req, res) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
 
-    const response = await fetch(targetUrl, {
+    const response = await fetchWithFallback(targetUrl, {
       method: 'HEAD',
       headers: US_HEADERS,
       redirect: 'follow',
